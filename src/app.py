@@ -221,54 +221,65 @@ def predict():
 
 @app.route("/route_by_name", methods=["POST"])
 def route_by_name():
-
     data = request.json
-
     start_coords = data.get("start_coords")
     end_coords = data.get("end_coords")
-
     hour = int(data.get("hour", 9))
+    is_emergency = data.get("isEmergency", False) # Get emergency flag
 
-    # Find nearest nodes
+    # 1. Find nearest nodes in the graph
     _, start_idx = spatial_index.query(start_coords)
     _, end_idx = spatial_index.query(end_coords)
+    start_idx, end_idx = int(start_idx), int(end_idx)
 
-    start_idx = int(start_idx)
-    end_idx = int(end_idx)
-
+    # 2. Reset and Apply Weights based on Traffic/Emergency
     intensity = rush_hour(hour)
-
-    for u, v in routing_graph.edges():
-
-        bias = 1.0
-
-        if intensity > 0.7:
-            bias = 15.0
-
-        elif intensity > 0.4:
-            bias = 4.0
-
-        routing_graph[u][v]["weight"] *= bias
+    
+    for u, v, d in routing_graph.edges(data=True):
+        # Base weight is the physical distance
+        base_dist = math.dist(node_to_coord[u], node_to_coord[v])
+        
+        if is_emergency:
+            # Emergency Mode: "Green Wave" (All roads are fast/cheap)
+            routing_graph[u][v]["weight"] = base_dist * 0.1 
+        else:
+            # Normal Mode: Apply Traffic Bias
+            bias = 1.0
+            if intensity > 0.7: bias = 15.0
+            elif intensity > 0.4: bias = 4.0
+            routing_graph[u][v]["weight"] = base_dist * bias
 
     try:
+        # --- PATH 1: MAIN OPTIMIZED ROUTE ---
+        main_path = nx.shortest_path(routing_graph, source=start_idx, target=end_idx, weight="weight")
+        main_coords = [node_to_coord[p] for p in main_path]
+        
+        # --- PATH 2: ALTERNATIVE ROUTE ---
+        # Temporarily penalize edges used in the main path to force a different route
+        original_weights = {}
+        for i in range(len(main_path) - 1):
+            u, v = main_path[i], main_path[i+1]
+            original_weights[(u, v)] = routing_graph[u][v]["weight"]
+            routing_graph[u][v]["weight"] *= 50.0 # Make these roads "expensive"
 
-        path = nx.shortest_path(
-            routing_graph,
-            source=start_idx,
-            target=end_idx,
-            weight="weight"
-        )
+        try:
+            alt_path = nx.shortest_path(routing_graph, source=start_idx, target=end_idx, weight="weight")
+            alt_coords = [node_to_coord[p] for p in alt_path]
+        except:
+            alt_coords = [] # Fallback if no alternative exists
 
-        path_coords = [node_to_coord[p] for p in path]
+        # Restore weights so future requests aren't broken
+        for (u, v), weight in original_weights.items():
+            routing_graph[u][v]["weight"] = weight
 
         return jsonify({
-            "coordinates": path_coords,
-            "distance_nodes": len(path)
+            "coordinates": main_coords,
+            "alt_coordinates": alt_coords,
+            "is_emergency": is_emergency
         })
 
     except nx.NetworkXNoPath:
         return jsonify({"error": "No path found"}), 404
-
 # -------------------------
 # RUN SERVER
 # -------------------------
